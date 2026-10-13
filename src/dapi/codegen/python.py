@@ -94,7 +94,16 @@ def generate_python(spec: ClientSpec) -> str:
     w(f"LOGIN_FLOW: dict[str, Any] | None = {_token_flow_literal(a.login)}\n")
     w(f"REFRESH_FLOW: dict[str, Any] | None = {_token_flow_literal(a.refresh)}\n")
     w(f"CSRF_PAIRS: list[dict[str, str]] = {a.csrf!r}  # header <- cookie echo, observed\n")
-    w(f"TOKEN_LIFETIME_SECONDS: float | None = {a.lifetime_seconds!r}\n\n")
+    w(f"TOKEN_LIFETIME_SECONDS: float | None = {a.lifetime_seconds!r}\n")
+    gql_docs = {
+        o.graphql["operation_name"]: {
+            "query": o.graphql.get("document"),
+            "extensions": o.graphql.get("extensions"),
+        }
+        for o in spec.operations
+        if o.graphql
+    }
+    w(f"GRAPHQL_OPERATIONS: dict[str, dict[str, Any]] = {gql_docs!r}  # observed documents\n\n")
     if a.notes:
         w("# Auth evidence (from dapi auth analysis):\n")
         for n in a.notes[:12]:
@@ -115,13 +124,29 @@ def generate_python(spec: ClientSpec) -> str:
         w(_render_op(op, *op_types[op.name]))
     w(
         "\n\n__all__ = ["
-        + ", ".join(repr(x) for x in [spec.class_name, "ApiError", *(m.name for m in reg.models)])
+        + ", ".join(
+            repr(x) for x in [spec.class_name, "ApiError", "GraphQLError", *(m.name for m in reg.models)]
+        )
         + "]\n"
     )
     return "".join(out)
 
 
+def _render_graphql_op(op: Operation, resp_type: str, body_type: str | None) -> str:
+    g = op.graphql or {}
+    var_type = body_type or "dict[str, Any]"
+    default = "" if op.body_required else " | None = None"
+    auth = "False" if op.auth_required == "no" else "True"
+    return (
+        f"\n    def {op.name}(self, variables: {var_type}{default}) -> {resp_type}:\n"
+        + _doc(op.doc, "        ")
+        + f"        return self._graphql({op.method!r}, {op.path!r}, {g['operation_name']!r}, variables, auth={auth})\n"
+    )
+
+
 def _render_op(op: Operation, resp_type: str, body_type: str | None) -> str:
+    if op.graphql:
+        return _render_graphql_op(op, resp_type, body_type)
     args = ["self"]
     for p in op.path_params:
         args.append(f"{p.name}: {_param_type(p.type)} | str")
@@ -152,7 +177,16 @@ def _render_op(op: Operation, resp_type: str, body_type: str | None) -> str:
     return "".join(lines)
 
 
-RUNTIME = r'''class ApiError(Exception):
+RUNTIME = r'''class GraphQLError(Exception):
+    """Raised when a GraphQL response carries errors and no data."""
+
+    def __init__(self, operation: str, errors: list[Any]):
+        self.operation = operation
+        self.errors = errors
+        super().__init__(f"{operation}: {_json.dumps(errors)[:300]}")
+
+
+class ApiError(Exception):
     """Raised for non-2xx responses."""
 
     def __init__(self, response: httpx.Response):
@@ -394,6 +428,33 @@ class __CLASS__:
             except ValueError:
                 return resp.text
         return resp.text
+
+    def _graphql(self, method: str, path: str, operation: str, variables: Any, *, auth: bool = True) -> Any:
+        spec = GRAPHQL_OPERATIONS.get(operation, {})
+        payload: dict[str, Any] = {"operationName": operation, "variables": variables or {}}
+        if spec.get("query"):
+            payload["query"] = spec["query"]
+        if spec.get("extensions"):
+            payload["extensions"] = spec["extensions"]
+
+        def call() -> Any:
+            if method == "GET":
+                params = {k: v if isinstance(v, str) else _json.dumps(v) for k, v in payload.items()}
+                return self._request("GET", path, params=params, auth=auth, expect="json")
+            return self._request(method, path, json=payload, auth=auth, expect="json")
+
+        result = call()
+        errors = result.get("errors") if isinstance(result, dict) else None
+        if errors and not result.get("data"):
+            auth_error = any(
+                w in _json.dumps(errors).lower() for w in ("unauth", "forbidden", "token", "login", "credential")
+            )
+            if auth and auth_error and self.auto_refresh and self._reauthenticate():
+                result = call()
+                errors = result.get("errors") if isinstance(result, dict) else None
+            if errors and not result.get("data"):
+                raise GraphQLError(operation, errors)
+        return result
 
     # -- endpoints (one per observed endpoint) ----------------------------------------------------
 '''

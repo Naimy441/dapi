@@ -150,7 +150,7 @@ def discover_dependencies(
         ep = ctx.catalog.get(endpoint_id)
         target = ep.id if ep else endpoint_id
         result = [e for e in result if e["to"] == target or e["from"] == target]
-    names = {e.id: f"{e.method} {e.path_template}" for e in ctx.catalog.endpoints}
+    names = {e.id: e.label for e in ctx.catalog.endpoints}
     for e in result:
         e["from_endpoint"] = names.get(e["from"], e["from"])
         e["to_endpoint"] = names.get(e["to"], e["to"])

@@ -53,3 +53,32 @@ def run_web_session(client: httpx.Client, base: str) -> None:
         json={"title": "New", "body": "x"},
         headers={"X-CSRFToken": client.cookies["csrftoken"]},
     )
+
+
+VIEWER = "query Viewer {\n  viewer { id name projectCount }\n}"
+PROJECT = "query Project($id: ID!) {\n  project(id: $id) { id name archived tasks { id title status } }\n}"
+CREATE_TASK = "mutation CreateTask($projectId: ID!, $title: String!) {\n  createTask(projectId: $projectId, title: $title) { id title }\n}"
+
+
+def run_graphql_session(client: httpx.Client, base: str) -> None:
+    """A GraphQL client: unauthenticated query (errors-only 200), login, queries, a mutation."""
+    url = f"{base}/api/graphql"
+    client.post(url, json={"operationName": "Viewer", "query": VIEWER, "variables": {}})
+    tokens = client.post(
+        f"{base}/api/v1/auth/login", json={"username": "demo", "password": "demo-password"}
+    ).json()
+    auth = {"Authorization": f"Bearer {tokens['access_token']}"}
+    client.post(url, json={"operationName": "Viewer", "query": VIEWER, "variables": {}}, headers=auth)
+    for pid in (101, 102):
+        client.post(
+            url, json={"operationName": "Project", "query": PROJECT, "variables": {"id": pid}}, headers=auth
+        )
+    client.post(
+        url,
+        json={
+            "operationName": "CreateTask",
+            "query": CREATE_TASK,
+            "variables": {"projectId": 101, "title": "via graphql"},
+        },
+        headers=auth,
+    )

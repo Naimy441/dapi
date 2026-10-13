@@ -36,7 +36,7 @@ def generate_openapi(analysis: Analysis, origin: str, flow_count: int = 0) -> di
             "operationId": next(
                 (o.name for o in spec.operations if o.endpoint_id == ep.id), re.sub(r"\W+", "_", ep.key)
             ),
-            "summary": f"{ep.method} {ep.path_template}",
+            "summary": ep.label,
             "x-dapi-endpoint-id": ep.id,
             "x-dapi-evidence-flows": ep.flow_ids[:20],
             "x-dapi-auth": ep.auth,
@@ -88,7 +88,8 @@ def generate_openapi(analysis: Analysis, origin: str, flow_count: int = 0) -> di
             }
         responses: dict[str, Any] = {}
         for status, r in ep.responses.items():
-            key = status if status.isdigit() else "default"
+            code = status.split("-")[0]
+            key = code if code.isdigit() else "default"
             entry: dict[str, Any] = {
                 "description": f"Observed {r['count']} time(s)",
                 "x-dapi-evidence-flows": r["flow_ids"],
@@ -98,13 +99,24 @@ def generate_openapi(analysis: Analysis, origin: str, flow_count: int = 0) -> di
                     ct: ({"schema": r["schema"]} if r["schema"] and "json" in ct else {})
                     for ct in r["content_types"]
                 }
-            responses[key] = entry
+            if status.endswith("-errors"):
+                entry["description"] += " with a GraphQL errors-only payload"
+            if key in responses:  # e.g. GraphQL 200 data vs. 200 errors-only
+                responses[key].setdefault("x-dapi-variants", []).append(entry)
+            else:
+                responses[key] = entry
         op["responses"] = responses or {"default": {"description": "No response observed"}}
         if security_schemes and ep.auth.get("required") in ("yes", "likely"):
             op["security"] = [{"observedAuth": []}]
         elif ep.auth.get("required") == "no":
             op["security"] = []
-        paths.setdefault(ep.path_template, {})[ep.method.lower()] = op
+        if ep.graphql:
+            # one OpenAPI path entry per GraphQL operation (they share the HTTP endpoint)
+            op["x-dapi-graphql"] = ep.graphql
+            path_key = f"{ep.path_template}#{ep.graphql['operation_name']}"
+        else:
+            path_key = ep.path_template
+        paths.setdefault(path_key, {})[ep.method.lower()] = op
     doc: dict[str, Any] = {
         "openapi": "3.1.0",
         "info": {

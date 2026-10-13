@@ -147,6 +147,13 @@ response, such as a CSRF cookie set by `GET /login`. dapi plans that call as a *
 `client.login()` fetches a fresh token first, then posts the form. `examples/demo_web_app.py` exercises
 this end to end.
 
+**GraphQL.** Each GraphQL operation becomes its own endpoint, keyed by `operationName` or parsed from the
+document. That gives each operation its own variables schema, response schema and auth evidence. Query
+operations count as read-only, so verification may call them. Mutations are never sent. Many servers reject
+auth with `200 {"errors": [...]}`, and dapi treats those responses as rejections. Generated clients get one
+method per operation (`client.project({"id": 101})`). The method sends the observed document, raises
+`GraphQLError` on errors-only replies, and re-authenticates on auth errors.
+
 **Grounded codegen.** Generated clients use the auth strategy that ablation proved. They replay the
 observed login and refresh request bodies as templates, with credentials as parameters, and read new tokens
 from the JSON paths where they were observed. They refresh proactively before expiry and reactively on 401.
@@ -182,7 +189,7 @@ workspace.
 
 ```bash
 uv venv && uv pip install -e '.[dev]'
-.venv/bin/pytest            # unit + e2e: real mitmproxy (HTTP and HTTPS), bearer and cookie/CSRF demo apps,
+.venv/bin/pytest            # unit + e2e: real mitmproxy (HTTP and HTTPS), bearer, cookie/CSRF and GraphQL demos,
                             # MCP over stdio, generated clients compiled with tsc and run on node
 .venv/bin/ruff check . && .venv/bin/ruff format --check .
 ```
@@ -191,9 +198,8 @@ Agents working on this repository: see [AGENTS.md](AGENTS.md).
 
 ## Status and roadmap
 
-This is an MVP focused on REST/JSON over HTTP(S). Planned next:
+This is an MVP focused on REST/JSON and GraphQL over HTTP(S). Planned next:
 
-- GraphQL operation-level cataloging
 - WebSocket and SSE flows
 - multipart bodies
 - OAuth PKCE and redirect flow mapping

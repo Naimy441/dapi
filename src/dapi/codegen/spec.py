@@ -85,6 +85,8 @@ class Operation:
     response_kind: str  # "json" | "text" | "empty"
     auth_required: str
     doc: list[str]
+    # GraphQL operation: {"operation_name", "operation_type", "document", "extensions"}
+    graphql: dict[str, Any] | None = None
 
 
 @dataclass
@@ -298,6 +300,9 @@ def _py_ident_ok(name: str) -> bool:
 
 
 def _op_name(ep: Endpoint, prefix_len: int) -> str:
+    if ep.graphql:
+        name = ep.graphql["operation_name"]
+        return snake(name) if name != "anonymous" else f"{ep.graphql['operation_type']}_operation"
     segs = [s for s in ep.path_template.split("/") if s][prefix_len:]
     words: list[str] = []
     for seg in segs:
@@ -349,7 +354,7 @@ def build_spec(
     auth = build_auth_spec(analysis, origin)
     skip_tags = {"login", "refresh"}
     endpoints = [e for e in endpoints if not set(e.tags) & skip_tags]
-    prefix = _common_prefix(endpoints)
+    prefix = _common_prefix([e for e in endpoints if not e.graphql])
     ops: list[Operation] = []
     used: dict[str, int] = {}
     for ep in endpoints:
@@ -374,7 +379,50 @@ def build_spec(
     )
 
 
+def _graphql_operation(ep: Endpoint, name: str) -> Operation:
+    g = ep.graphql or {}
+    success = ep.success_statuses()
+    status = str(success[0]) if success else None
+    schema = (ep.responses.get(status) or {}).get("schema") or {} if status else {}
+    doc = [ep.label, ""]
+    flows = ep.flow_ids
+    doc.append(
+        f"Evidence: {len(flows)} observed flow(s) ({', '.join('#' + str(f) for f in flows[:5])}"
+        f"{', ...' if len(flows) > 5 else ''})."
+    )
+    if ep.auth:
+        doc.append(f"Auth: {ep.auth.get('required', 'unknown')} -- {ep.auth.get('evidence', '')}.")
+    if g.get("operation_type") != "query":
+        doc.append(f"Side effects: {ep.read_only_reason}.")
+    if g.get("document"):
+        doc += [
+            "",
+            "Observed document:",
+            *("    " + line for line in g["document"].strip().splitlines()[:25]),
+        ]
+    required_vars = bool((ep.request_schema or {}).get("required"))
+    return Operation(
+        name=name,
+        method=ep.method,
+        path=ep.path_template,
+        endpoint_id=ep.id,
+        path_params=[],
+        query_params=[],
+        body_kind="json",
+        body_schema=ep.request_schema,
+        body_required=required_vars,
+        response_schema=schema,
+        response_status=status,
+        response_kind="json" if schema else "text",
+        auth_required=(ep.auth or {}).get("required", "unknown"),
+        doc=doc,
+        graphql=g,
+    )
+
+
 def _operation(ep: Endpoint, name: str) -> Operation:
+    if ep.graphql:
+        return _graphql_operation(ep, name)
     path_params = [
         Param(name=snake(p["name"]), wire=p["name"], type=p["type"], examples=p["examples"])
         for p in ep.path_params
@@ -412,7 +460,7 @@ def _operation(ep: Endpoint, name: str) -> Operation:
     resp_kind = (
         "json" if schema else ("empty" if status == "204" or not resp.get("content_types") else "text")
     )
-    doc = [f"{ep.method} {ep.path_template}", ""]
+    doc = [ep.label, ""]
     flows = ep.flow_ids
     doc.append(
         f"Evidence: {len(flows)} observed flow(s) ({', '.join('#' + str(f) for f in flows[:5])}"

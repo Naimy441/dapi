@@ -16,7 +16,7 @@ from dataclasses import dataclass, field
 from typing import Any
 from urllib.parse import parse_qsl
 
-from dapi.analysis.catalog import Catalog, Endpoint, parse_json
+from dapi.analysis.catalog import Catalog, Endpoint, flow_rejected_for_auth, flow_succeeded, parse_json
 from dapi.models import Exchange, header_get, is_form_type
 from dapi.store import Sighting
 from dapi.vault import Vault
@@ -174,7 +174,8 @@ def _body_field(flow: Exchange, location: str) -> Any:
 def _ep_ref(ep: Endpoint | None) -> dict[str, Any]:
     if ep is None:
         return {"endpoint_id": None, "endpoint": "(unknown)"}
-    return {"endpoint_id": ep.id, "endpoint": f"{ep.method} {ep.origin}{ep.path_template}"}
+    op = f" ({ep.graphql['operation_type']} {ep.graphql['operation_name']})" if ep.graphql else ""
+    return {"endpoint_id": ep.id, "endpoint": f"{ep.method} {ep.origin}{ep.path_template}{op}"}
 
 
 def analyze_auth(ctx: AuthContext, origin: str | None = None) -> dict[str, Any]:
@@ -404,10 +405,10 @@ def _analyze_origin(ctx: AuthContext, origin: str, flows: list[Exchange]) -> dic
         with_creds = [f for f in ep_flows if ctx.presentations(f.id)]
         without = [f for f in ep_flows if not ctx.presentations(f.id)]
         locs = sorted({s.location for f in with_creds for s in ctx.presentations(f.id)})
-        ok_without = [f.id for f in without if f.status and 200 <= f.status < 300]
-        denied_without = [f.id for f in without if f.status in (401, 403)]
-        denied_with = [f.id for f in with_creds if f.status in (401, 403)]
-        ok_with = [f.id for f in with_creds if f.status and 200 <= f.status < 300]
+        ok_without = [f.id for f in without if flow_succeeded(f, ep)]
+        denied_without = [f.id for f in without if flow_rejected_for_auth(f, ep)]
+        denied_with = [f.id for f in with_creds if flow_rejected_for_auth(f, ep)]
+        ok_with = [f.id for f in with_creds if flow_succeeded(f, ep)]
         if ok_without:
             required, evidence = "no", f"succeeded without credentials (flows {_ids(ok_without)})"
         elif denied_without:

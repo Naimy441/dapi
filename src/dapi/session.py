@@ -24,7 +24,7 @@ import httpx
 
 from dapi.analysis import Analysis, Endpoint, analyze
 from dapi.analysis.auth import AuthContext
-from dapi.analysis.catalog import parse_json
+from dapi.analysis.catalog import flow_succeeded, parse_json
 from dapi.analysis.schema import check
 from dapi.models import Exchange, RawExchange, is_form_type, is_json_type
 from dapi.redact import parse_cookie_header
@@ -46,6 +46,27 @@ SKIP_HEADERS = {
     "http2-settings",
 }
 SAFE_VERIFY_METHODS = {"GET", "HEAD"}
+
+
+def succeeded(ep: Endpoint, resp: httpx.Response) -> bool:
+    """2xx, and for GraphQL also not an ``errors``-only payload (servers often reject auth with 200)."""
+    if not 200 <= resp.status_code < 300:
+        return False
+    if ep.graphql:
+        try:
+            body = resp.json()
+        except ValueError:
+            return False
+        if isinstance(body, dict) and body.get("errors") and not body.get("data"):
+            return False
+    return True
+
+
+def verifiable(ep: Endpoint) -> bool:
+    """Safe to call during verification: read-only GET/HEAD, or a GraphQL *query* operation."""
+    if not ep.read_only:
+        return False
+    return ep.method in SAFE_VERIFY_METHODS or bool(ep.graphql and ep.graphql["operation_type"] == "query")
 
 
 @dataclass
@@ -87,9 +108,9 @@ def current_session(ws: Workspace, analysis: Analysis, origin: str) -> Session |
         (f for f in ctx.flows.values() if f.origin == origin), key=lambda f: (f.ts, f.id), reverse=True
     )
     for f in flows:
-        if not (f.status and 200 <= f.status < 300):
-            continue
         ep = ctx.endpoint_of(f.id)
+        if not flow_succeeded(f, ep):
+            continue
         if ep and set(ep.tags) & {"login", "refresh", "logout"}:
             continue
         pres = ctx.presentations(f.id)
@@ -274,7 +295,7 @@ def send_and_record(
 # -- verification --------------------------------------------------------------------------------
 def _evidence_flow(analysis: Analysis, ep: Endpoint) -> Exchange | None:
     flows = [analysis.ctx.flows[i] for i in ep.flow_ids if i in analysis.ctx.flows]
-    ok = [f for f in flows if f.status and 200 <= f.status < 300 and not refs_in(f.path)]
+    ok = [f for f in flows if flow_succeeded(f, ep) and not refs_in(f.path)]
     return max(ok, key=lambda f: (f.ts, f.id)) if ok else None
 
 
@@ -288,7 +309,7 @@ def _candidates(
             ep = analysis.catalog.get(eid)
             if ep is None or ep.origin != origin:
                 rejected.append({"endpoint_id": eid, "reason": "unknown endpoint for this origin"})
-            elif not ep.read_only or ep.method not in SAFE_VERIFY_METHODS:
+            elif not verifiable(ep):
                 rejected.append({"endpoint_id": eid, "reason": f"not read-only ({ep.read_only_reason})"})
             else:
                 eps.append(ep)
@@ -297,7 +318,7 @@ def _candidates(
         e
         for e in analysis.catalog.for_origin(origin)
         if e.read_only
-        and e.method in SAFE_VERIFY_METHODS
+        and verifiable(e)
         and e.success_statuses()
         and not set(e.tags) & {"login", "refresh", "logout"}
     ]
@@ -312,7 +333,7 @@ def _check_endpoint(
     ws: Workspace, analysis: Analysis, ep: Endpoint, session: Session | None, timeout: float
 ) -> dict[str, Any]:
     flow = _evidence_flow(analysis, ep)
-    result: dict[str, Any] = {"endpoint_id": ep.id, "endpoint": f"{ep.method} {ep.path_template}"}
+    result: dict[str, Any] = {"endpoint_id": ep.id, "endpoint": ep.label}
     if flow is None:
         return {**result, "ok": False, "error": "no successful evidence flow to base the request on"}
     req = build_request(ws, analysis.ctx, flow, session)
@@ -322,7 +343,7 @@ def _check_endpoint(
         return {**result, "ok": False, "error": error}
     result["status"] = resp.status_code
     result["latency_ms"] = round(resp.elapsed.total_seconds() * 1000, 1)
-    result["ok"] = 200 <= resp.status_code < 300
+    result["ok"] = succeeded(ep, resp)
     schema = (ep.responses.get(str(resp.status_code)) or {}).get("schema")
     if result["ok"] and schema:
         try:
@@ -391,8 +412,8 @@ def verify_session(
                 "status": status,
                 "recorded_flow": fid,
                 "auth_required": None
-                if status is None
-                else (status in (401, 403) or (r.get("ok") and not 200 <= status < 300)),
+                if resp is None
+                else (status in (401, 403) or (bool(r.get("ok")) and not succeeded(ep, resp))),
                 **({"error": err} if err else {}),
             }
         report["credential_ablation"] = _ablate(ws, analysis, candidates, results, session, timeout)
@@ -449,7 +470,7 @@ def _ablate(
                 ws, build_request(ws, analysis.ctx, flow, reduced), "dapi-probe", timeout
             )
             loc = f"header:{name.lower()}" if kind == "header" else f"cookie:{name}"
-            necessary[loc] = None if resp is None else not (200 <= resp.status_code < 300)
+            necessary[loc] = None if resp is None else not succeeded(ep, resp)
     ws.store.kv_set(
         f"ablation:{session.origin}", {"endpoint": ep.id, "necessary": necessary, "ts": time.time()}
     )

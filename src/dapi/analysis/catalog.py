@@ -125,10 +125,21 @@ class Endpoint:
     read_only_reason: str = ""
     auth: dict[str, Any] = field(default_factory=dict)
     tags: list[str] = field(default_factory=list)
+    # GraphQL: {"operation_name", "operation_type", "document", "extensions"} for per-operation endpoints
+    graphql: dict[str, Any] | None = None
 
     @property
     def key(self) -> str:
-        return f"{self.method} {self.origin}{self.path_template}"
+        suffix = f"#{self.graphql['operation_name']}" if self.graphql else ""
+        return f"{self.method} {self.origin}{self.path_template}{suffix}"
+
+    @property
+    def label(self) -> str:
+        """Short human-readable name: ``GET /users/{id}`` or ``POST /graphql (query Viewer)``."""
+        if self.graphql:
+            g = self.graphql
+            return f"{self.method} {self.path_template} ({g['operation_type']} {g['operation_name']})"
+        return f"{self.method} {self.path_template}"
 
     def success_statuses(self) -> list[int]:
         return sorted(int(s) for s in self.responses if s.isdigit() and 200 <= int(s) < 300)
@@ -144,6 +155,11 @@ class Endpoint:
             "read_only": self.read_only,
             "auth": self.auth.get("required", "unknown"),
             **({"tags": self.tags} if self.tags else {}),
+            **(
+                {"graphql": f"{self.graphql['operation_type']} {self.graphql['operation_name']}"}
+                if self.graphql
+                else {}
+            ),
         }
 
     def to_dict(self) -> dict[str, Any]:
@@ -268,23 +284,105 @@ def _value_type(values: list[str]) -> str:
     return "string"
 
 
+AUTH_ERROR_RE = re.compile(
+    r"(?i)(unauth|not auth|forbidden|permission|login|log in|sign in|token|credential)"
+)
+
+
+def _graphql_errors_only(ex: Exchange) -> list[Any] | None:
+    data = parse_json(ex.resp_body)
+    if isinstance(data, dict) and data.get("errors") and not data.get("data"):
+        return data["errors"] if isinstance(data["errors"], list) else [data["errors"]]
+    return None
+
+
+def flow_succeeded(ex: Exchange, ep: Endpoint | None) -> bool:
+    """2xx, and for GraphQL operations not an ``errors``-only payload."""
+    if ex.status is None or not 200 <= ex.status < 300:
+        return False
+    return not (ep is not None and ep.graphql and _graphql_errors_only(ex))
+
+
+def flow_rejected_for_auth(ex: Exchange, ep: Endpoint | None) -> bool:
+    """401/403, or a GraphQL errors-only response whose errors mention authentication."""
+    if ex.status in (401, 403):
+        return True
+    if ep is not None and ep.graphql and ex.status is not None and 200 <= ex.status < 300:
+        errors = _graphql_errors_only(ex)
+        return bool(errors) and bool(AUTH_ERROR_RE.search(str(errors)))
+    return False
+
+
+GQL_OP_RE = re.compile(r"^\s*(query|mutation|subscription)\b\s*([A-Za-z_][A-Za-z0-9_]*)?")
+
+
+def graphql_operation(ex: Exchange) -> dict[str, Any] | None:
+    """Recognize a GraphQL request (POST JSON body or GET query string) and describe its operation."""
+    body: Any = None
+    if (
+        ex.method == "POST"
+        and ex.req_body
+        and (is_json_type(ex.req_content_type) or ex.req_body.lstrip()[:1] == "{")
+    ):
+        body = parse_json(ex.req_body)
+    elif ex.method == "GET":
+        q = dict(ex.query)
+        if "query" in q or "extensions" in q:
+            body = {
+                "query": q.get("query"),
+                "operationName": q.get("operationName"),
+                "extensions": parse_json(q.get("extensions")),
+            }
+    if not isinstance(body, dict):
+        return None
+    document, extensions = body.get("query"), body.get("extensions")
+    persisted = isinstance(extensions, dict) and "persistedQuery" in extensions
+    if not (isinstance(document, str) and "{" in document) and not persisted:
+        return None
+    m = GQL_OP_RE.match(document or "")
+    if m:
+        op_type = m.group(1)
+    elif isinstance(document, str) and document.lstrip().startswith("{"):
+        op_type = "query"  # shorthand query syntax
+    else:
+        op_type = "unknown"  # persisted query without a document
+    name = body.get("operationName") or (m.group(2) if m else None) or "anonymous"
+    return {
+        "operation_name": str(name),
+        "operation_type": op_type,
+        "document": document if isinstance(document, str) else None,
+        "extensions": extensions if persisted else None,
+    }
+
+
 def build_catalog(flows: list[Exchange]) -> Catalog:
     flows = [ex for ex in flows if ex.id is not None]
     segs = _template_segments(flows)
-    grouped: dict[tuple[str, str, str], list[Exchange]] = defaultdict(list)
-    templates: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
+    grouped: dict[tuple[str, str, str, str], list[Exchange]] = defaultdict(list)
+    templates: dict[tuple[str, str, str, str], list[dict[str, Any]]] = {}
+    gql: dict[int, dict[str, Any]] = {}
     for ex in flows:
         template, params = _name_params(segs[ex.id])
-        key = (ex.method, ex.origin, template)
+        op = graphql_operation(ex)
+        if op:
+            gql[ex.id] = op
+        key = (ex.method, ex.origin, template, op["operation_name"] if op else "")
         grouped[key].append(ex)
         templates[key] = params
 
     endpoints: list[Endpoint] = []
     flow_endpoint: dict[int, str] = {}
     flow_params: dict[int, dict[str, str]] = {}
-    for (method, origin, template), exs in grouped.items():
-        ep_id = "e_" + hashlib.sha1(f"{method} {origin}{template}".encode()).hexdigest()[:8]
+    for (method, origin, template, op_name), exs in grouped.items():
+        suffix = f"#{op_name}" if op_name else ""
+        ep_id = "e_" + hashlib.sha1(f"{method} {origin}{template}{suffix}".encode()).hexdigest()[:8]
         ro, reason = is_read_only(method, template)
+        graphql = gql.get(exs[-1].id) if op_name else None
+        if graphql:
+            if graphql["operation_type"] == "query" and not MUTATING_PATH_RE.search(op_name):
+                ro, reason = True, "GraphQL query operation (side-effect free by specification)"
+            elif graphql["operation_type"] != "query":
+                ro, reason = False, f"GraphQL {graphql['operation_type']} operation"
         ep = Endpoint(
             id=ep_id,
             method=method,
@@ -296,9 +394,10 @@ def build_catalog(flows: list[Exchange]) -> Catalog:
             last_seen=max(e.ts for e in exs),
             read_only=ro,
             read_only_reason=reason,
+            graphql=graphql,
         )
         # path params
-        params = templates[(method, origin, template)]
+        params = templates[(method, origin, template, op_name)]
         examples: dict[str, list[str]] = defaultdict(list)
         for ex in exs:
             raw_parts = ex.path.split("/")[1:]
@@ -367,8 +466,10 @@ def build_catalog(flows: list[Exchange]) -> Catalog:
             ct = media_type(ex.req_content_type)
             if ct and ct not in cts:
                 cts.append(ct)
-            if is_json_type(ex.req_content_type):
+            if is_json_type(ex.req_content_type) or graphql:
                 data = parse_json(ex.req_body)
+                if graphql and isinstance(data, dict):
+                    data = data.get("variables") or {}  # the document is fixed; variables are the input
                 if data is not None:
                     req_builder.add(data)
             elif is_form_type(ex.req_content_type):
@@ -378,7 +479,10 @@ def build_catalog(flows: list[Exchange]) -> Catalog:
         # responses
         by_status: dict[str, list[Exchange]] = defaultdict(list)
         for ex in exs:
-            by_status[str(ex.status) if ex.status is not None else "error"].append(ex)
+            key = str(ex.status) if ex.status is not None else "error"
+            if graphql and _graphql_errors_only(ex):
+                key += "-errors"  # GraphQL rejections often use HTTP 200; keep them out of the data schema
+            by_status[key].append(ex)
         for status, sexs in sorted(by_status.items()):
             builder = SchemaBuilder()
             r_cts: list[str] = []

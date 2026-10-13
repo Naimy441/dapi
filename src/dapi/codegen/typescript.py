@@ -97,6 +97,17 @@ def generate_typescript(spec: ClientSpec) -> str:
     w(f"const LOGIN_FLOW: TokenFlow | null = {_flow_literal(a.login)};\n")
     w(f"const REFRESH_FLOW: TokenFlow | null = {_flow_literal(a.refresh)};\n")
     w(f"const SESSION_COOKIES: string[] = {json.dumps(a.cookie_names)};\n")
+    gql_docs = {
+        o.graphql["operation_name"]: {
+            "query": o.graphql.get("document"),
+            "extensions": o.graphql.get("extensions"),
+        }
+        for o in spec.operations
+        if o.graphql
+    }
+    w(
+        f"const GRAPHQL_OPERATIONS: Record<string, {{ query: string | null; extensions: unknown }}> = {json.dumps(gql_docs, indent=2)};\n"
+    )
     w(
         f"const CSRF_PAIRS: Array<{{ header: string; cookie: string }}> = {json.dumps(a.csrf)}; // header <- cookie echo\n\n"
     )
@@ -118,7 +129,23 @@ def generate_typescript(spec: ClientSpec) -> str:
     return "".join(out)
 
 
+def _render_graphql_op(op: Operation, resp_type: str, body_type: str | None) -> str:
+    g = op.graphql or {}
+    var_type = body_type or "Record<string, unknown>"
+    opt = "" if op.body_required else "?"
+    doc = "\n".join(f"   * {line}".rstrip() for line in op.doc).replace("*/", "* /")
+    auth = "false" if op.auth_required == "no" else "true"
+    return (
+        f"\n  /**\n{doc}\n   */\n"
+        f"  async {camel(op.name)}(variables{opt}: {var_type}): Promise<{resp_type}> {{\n"
+        f"    return this.graphql({json.dumps(op.method)}, {json.dumps(op.path)}, {json.dumps(g['operation_name'])}, variables, {auth}) as Promise<{resp_type}>;\n"
+        f"  }}\n"
+    )
+
+
 def _render_op(op: Operation, resp_type: str, body_type: str | None) -> str:
+    if op.graphql:
+        return _render_graphql_op(op, resp_type, body_type)
     args = [f"{camel(p.name)}: {_param_type(p.type)} | string" for p in op.path_params]
     if op.body_kind:
         args.append(f"body: {body_type or 'Record<string, unknown>'}")
@@ -173,6 +200,12 @@ interface RequestOptions {
   bodyKind?: "json" | "form";
   auth?: boolean;
   expect?: "json" | "text" | "empty";
+}
+
+export class GraphQLError extends Error {
+  constructor(public readonly operation: string, public readonly errors: unknown[]) {
+    super(`${operation}: ${JSON.stringify(errors).slice(0, 300)}`);
+  }
 }
 
 export class ApiError extends Error {
@@ -381,6 +414,29 @@ export class __CLASS__ {
       try { return JSON.parse(text); } catch { return text; }
     }
     return text;
+  }
+
+  protected async graphql(method: string, path: string, operation: string, variables: unknown, auth: boolean): Promise<unknown> {
+    const spec = GRAPHQL_OPERATIONS[operation] ?? { query: null, extensions: null };
+    const payload: Record<string, unknown> = { operationName: operation, variables: variables ?? {} };
+    if (spec.query) payload.query = spec.query;
+    if (spec.extensions) payload.extensions = spec.extensions;
+    const call = () =>
+      method === "GET"
+        ? this.request("GET", path, {
+            query: Object.fromEntries(Object.entries(payload).map(([k, v]) => [k, typeof v === "string" ? v : JSON.stringify(v)])),
+            auth, expect: "json",
+          })
+        : this.request(method, path, { body: payload, bodyKind: "json", auth, expect: "json" });
+    let result = (await call()) as Record<string, unknown>;
+    const errorsOnly = (r: Record<string, unknown>) => Array.isArray(r?.errors) && r.errors.length > 0 && !r.data;
+    if (errorsOnly(result)) {
+      const text = JSON.stringify(result.errors).toLowerCase();
+      const authError = ["unauth", "forbidden", "token", "login", "credential"].some((w) => text.includes(w));
+      if (auth && authError && this.autoRefresh && (await this.reauthenticate())) result = (await call()) as Record<string, unknown>;
+      if (errorsOnly(result)) throw new GraphQLError(operation, result.errors as unknown[]);
+    }
+    return result;
   }
 
   // ---- endpoints (one per observed endpoint) ----

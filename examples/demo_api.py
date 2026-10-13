@@ -139,6 +139,50 @@ def make_handler(state: State):
             auth = self.headers.get("Authorization") or ""
             return check_jwt(auth[7:]) if auth.startswith("Bearer ") else None
 
+        def _graphql(self, body: dict):
+            """Minimal GraphQL endpoint: dispatches on operationName (the document is not parsed)."""
+            uid = self._user()
+            if uid is None:
+                return self._send(
+                    200,
+                    {
+                        "data": None,
+                        "errors": [{"message": "Unauthenticated", "extensions": {"code": "UNAUTHENTICATED"}}],
+                    },
+                )
+            op, variables = body.get("operationName"), body.get("variables") or {}
+            if op == "Viewer":
+                u = next(v for v in USERS.values() if v["id"] == uid)
+                return self._send(
+                    200,
+                    {
+                        "data": {
+                            "viewer": {"id": u["id"], "name": u["name"], "projectCount": len(state.projects)}
+                        }
+                    },
+                )
+            if op == "Project":
+                p = state.projects.get(int(variables.get("id", 0)))
+                if p is None:
+                    return self._send(200, {"data": {"project": None}, "errors": [{"message": "Not found"}]})
+                return self._send(200, {"data": {"project": {**p, "tasks": state.tasks[p["id"]]}}})
+            if op == "CreateTask":
+                pid = int(variables.get("projectId", 0))
+                if pid not in state.projects:
+                    return self._send(200, {"data": None, "errors": [{"message": "Project not found"}]})
+                with state.lock:
+                    state.next_task += 1
+                    task = {
+                        "id": state.next_task,
+                        "project_id": pid,
+                        "title": variables.get("title", ""),
+                        "status": "open",
+                        "assignee": None,
+                    }
+                    state.tasks[pid].append(task)
+                return self._send(200, {"data": {"createTask": task}})
+            return self._send(200, {"data": None, "errors": [{"message": f"Unknown operation {op}"}]})
+
         def do_HEAD(self):
             self.do_GET()
 
@@ -194,6 +238,8 @@ def make_handler(state: State):
                 return self._send(200, state.issue(uid))
             if url.path == "/api/v1/auth/logout":
                 return self._send(204)
+            if url.path == "/api/graphql":
+                return self._graphql(body)
             uid = self._user()
             if uid is None:
                 return self._send(401, {"error": "unauthorized"}, {"WWW-Authenticate": 'Bearer realm="demo"'})
