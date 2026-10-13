@@ -243,7 +243,7 @@ def test_manual_session(ws, demo, monkeypatch):
             e["id"] for e in svc.endpoints_discover()["endpoints"] if e["path"] == "/api/v1/public/health"
         ]
     )
-    assert report["session"]["source"] == "manual"
+    assert report["session"]["source"].startswith("manual")
     assert tokens["access_token"] not in json.dumps(report)
 
 
@@ -318,3 +318,54 @@ def test_https_capture_through_mitmproxy(ws, tmp_path):
     assert any(m["type"] == "bearer" for m in auth["mechanisms"])
     detail = svc.traffic_get(3)
     assert detail["request"]["body"]["password"].startswith("{{secret:")
+
+
+def test_manual_session_overlays_observed(recorded):
+    from dapi.session import set_manual_session
+
+    ws, base = recorded
+    set_manual_session(ws, base, {"X-Debug-Token": "dbg-123456"}, {})
+    session = DapiService(ws).session_verify()["session"]
+    locations = {c["location"].lower() for c in session["credentials"]}
+    assert {"header:x-debug-token", "header:authorization"} <= locations
+    assert session["source"].startswith("manual + observed flow")
+
+
+def test_mitm_dump_import(ws, tmp_path):
+    from mitmproxy import io
+    from mitmproxy.http import Headers
+    from mitmproxy.test import tflow
+
+    path = tmp_path / "flows.mitm"
+    with open(path, "wb") as fh:
+        writer = io.FlowWriter(fh)
+        for i, (method, url, req_body, status, resp_body) in enumerate(
+            [
+                (
+                    "POST",
+                    "https://app.example.org/api/session",
+                    b'{"login":"bo","password":"mitm-pass-1"}',
+                    200,
+                    b'{"token":"tok-mitm-123456","ttl":60}',
+                ),
+                ("GET", "https://app.example.org/api/items/1", b"", 200, b'{"id":1}'),
+            ]
+        ):
+            f = tflow.tflow(resp=True)
+            f.request.method = method
+            f.request.url = url
+            f.request.headers = Headers(content_type="application/json")
+            if i == 1:
+                f.request.headers["X-Session-Token"] = "tok-mitm-123456"
+            f.request.content = req_body
+            f.response.status_code = status
+            f.response.headers = Headers(content_type="application/json")
+            f.response.content = resp_body
+            writer.add(f)
+    svc = DapiService(ws)
+    assert svc.traffic_import(str(path)) == {"format": "mitmproxy", "entries": 2, "recorded": 2, "skipped": 0}
+    auth = svc.auth_analyze()
+    mech = auth["mechanisms"][0]
+    assert mech["location"].lower() == "header:x-session-token"
+    assert mech["issued_by"][0]["location"] == "body:$.token"
+    assert "mitm-pass-1" not in json.dumps([svc.traffic_get(1), svc.traffic_get(2)])

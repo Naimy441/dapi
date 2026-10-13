@@ -137,8 +137,19 @@ def current_session(ws: Workspace, analysis: Analysis, origin: str) -> Session |
             source=data.get("source", "manual"),
             updated=updated,
         )
-        if derived is None or manual.updated >= derived.updated:
+        if derived is None:
             return manual
+        if manual.updated >= derived.updated:
+            # overlay: manual values replace same-named observed ones, the rest of the session is kept
+            names = {k.lower() for k in manual.headers}
+            headers = {k: v for k, v in derived.headers.items() if k.lower() not in names}
+            return Session(
+                origin=origin,
+                headers={**headers, **manual.headers},
+                cookies={**derived.cookies, **manual.cookies},
+                source=f"manual + {derived.source}",
+                updated=manual.updated,
+            )
     return derived
 
 

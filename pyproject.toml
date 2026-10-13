@@ -38,6 +38,7 @@ packages = ["src/dapi"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"
+filterwarnings = ["ignore::DeprecationWarning:mitmproxy.*", "ignore::DeprecationWarning:pyparsing.*"]
 
 [tool.ruff]
 line-length = 110
