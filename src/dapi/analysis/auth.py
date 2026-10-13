@@ -12,7 +12,7 @@ from __future__ import annotations
 import re
 import statistics
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 from urllib.parse import parse_qsl
 
@@ -52,6 +52,9 @@ class AuthContext:
     vault: Vault
     by_flow: dict[int, list[Sighting]]
     by_ref: dict[str, list[Sighting]]
+    metas: dict[str, dict[str, Any]] = field(default_factory=dict)
+    first_issue: dict[str, Sighting] = field(default_factory=dict)
+    _presentations: dict[int, list[Sighting]] = field(default_factory=dict)
 
     @classmethod
     def build(
@@ -64,30 +67,41 @@ class AuthContext:
             if s.flow_id in fmap:
                 by_flow[s.flow_id].append(s)
                 by_ref[s.ref].append(s)
-        for refs in by_ref.values():
+        first_issue: dict[str, Sighting] = {}
+        for ref, refs in by_ref.items():
             refs.sort(key=lambda s: (fmap[s.flow_id].ts, s.flow_id))
-        return cls(fmap, catalog, vault, by_flow, by_ref)
+            first = next((s for s in refs if s.side == "response"), None)
+            if first is not None:
+                first_issue[ref] = first
+        metas = {m["ref"]: m for m in vault.list()}
+        return cls(fmap, catalog, vault, by_flow, by_ref, metas, first_issue)
 
     # -- primitives ------------------------------------------------------------------------
+    def meta(self, ref: str) -> dict[str, Any]:
+        if ref not in self.metas:
+            self.metas[ref] = self.vault.meta(ref)
+        return self.metas[ref]
+
     def kind(self, ref: str) -> str:
-        return self.vault.meta(ref).get("kind", "secret")
+        return self.meta(ref).get("kind", "secret")
 
     def presentations(self, flow_id: int) -> list[Sighting]:
         """Credential presentations in a request: auth headers, cookies, query tokens."""
-        return [
-            s
-            for s in self.by_flow.get(flow_id, [])
-            if s.side == "request"
-            and s.location.startswith(PRESENTATION_PREFIXES)
-            and self.kind(s.ref) not in NON_CREDENTIAL_KINDS
-        ]
+        cached = self._presentations.get(flow_id)
+        if cached is None:
+            cached = [
+                s
+                for s in self.by_flow.get(flow_id, [])
+                if s.side == "request"
+                and s.location.startswith(PRESENTATION_PREFIXES)
+                and self.kind(s.ref) not in NON_CREDENTIAL_KINDS
+            ]
+            self._presentations[flow_id] = cached
+        return cached
 
     def issue(self, ref: str) -> Sighting | None:
         """The first response that carried this secret (where the client obtained it)."""
-        for s in self.by_ref.get(ref, []):
-            if s.side == "response":
-                return s
-        return None
+        return self.first_issue.get(ref)
 
     def latest_in_lineage(self, ref: str) -> str:
         """Follow credential rotation: newest secret issued at the same response location as ``ref``."""
@@ -209,7 +223,7 @@ def _analyze_origin(ctx: AuthContext, origin: str, flows: list[Exchange]) -> dic
         unknown_origin = 0
         for ref in m["refs"]:
             first = ctx.issue(ref)
-            meta = ctx.vault.meta(ref)
+            meta = ctx.meta(ref)
             lt, src = _lifetime(meta)
             if lt is not None:
                 lifetimes.append(lt)

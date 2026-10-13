@@ -140,6 +140,13 @@ credentials was rejected. `session_verify(probe_auth=true)` collects that eviden
 read-only request without credentials, then drops one credential at a time (ablation) to learn which one
 actually matters. In the demo, that test finds the bearer token REQUIRED and the `sid` cookie NOT required.
 
+**Cookie sessions and CSRF.** dapi also handles Django/Rails-style apps. Suppose a header value echoes a
+cookie (`X-CSRFToken` ← `csrftoken`). dapi records that as a CSRF pair, and generated clients copy the
+cookie into the header on every request. Suppose instead a login form field was issued by an earlier
+response, such as a CSRF cookie set by `GET /login`. dapi plans that call as a *login prerequisite*.
+`client.login()` fetches a fresh token first, then posts the form. `examples/demo_web_app.py` exercises
+this end to end.
+
 **Grounded codegen.** Generated clients use the auth strategy that ablation proved. They replay the
 observed login and refresh request bodies as templates, with credentials as parameters, and read new tokens
 from the JSON paths where they were observed. They refresh proactively before expiry and reactively on 401.
@@ -152,7 +159,8 @@ for module-level details and extension points.
 
 ```text
 dapi init [--scope HOST]...           create .dapi/ (git-ignored; holds flows + encrypted vault)
-dapi capture [--port 8080] [--scope] [--mode wireguard|reverse:URL|upstream:URL] [--listen-host 0.0.0.0] [-- mitmdump args]
+dapi capture [--port 8080] [--scope] [--mode wireguard|reverse:URL|upstream:URL] [--listen-host 0.0.0.0]
+             [--ssl-insecure] [-- mitmdump args]
 dapi import FILE                      HAR or mitmproxy dump
 dapi status | flows [ID] | endpoints | endpoint ID | auth | deps
 dapi verify [--probe-auth] [--allow-login] [--endpoint ID]...
@@ -174,7 +182,8 @@ workspace.
 
 ```bash
 uv venv && uv pip install -e '.[dev]'
-.venv/bin/pytest            # unit + end-to-end tests: real mitmproxy, demo API, MCP over stdio, tsc + node
+.venv/bin/pytest            # unit + e2e: real mitmproxy (HTTP and HTTPS), bearer and cookie/CSRF demo apps,
+                            # MCP over stdio, generated clients compiled with tsc and run on node
 .venv/bin/ruff check . && .venv/bin/ruff format --check .
 ```
 

@@ -484,9 +484,10 @@ def refresh_session(
             attempts.append({**attempt, "error": error})
             continue
         attempt["status"] = resp.status_code
-        if 200 <= resp.status_code < 300:
+        new = [s.location for s in ws.store.sightings(flow_id=flow_id) if s.side == "response"]
+        # logins often answer with a redirect; count it only if it actually issued credentials
+        if 200 <= resp.status_code < 300 or (300 <= resp.status_code < 400 and new):
             ws.invalidate()
-            new = [s.location for s in ws.store.sightings(flow_id=flow_id) if s.side == "response"]
             attempts.append({**attempt, "new_credentials": new})
             # a fresh observed session supersedes any stale manual one
             if ws.store.get_session(target):

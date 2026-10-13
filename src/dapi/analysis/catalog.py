@@ -174,15 +174,34 @@ class Catalog:
         return sorted({e.origin for e in self.endpoints})
 
 
+def _structure(value: Any, depth: int = 0) -> str:
+    """Structural fingerprint: types and keys (several levels deep), not values."""
+    if depth > 3:
+        return "*"
+    if isinstance(value, dict):
+        keys = sorted(value)[:40]
+        return "{" + ",".join(f"{k}:{_structure(value[k], depth + 1)}" for k in keys) + "}"
+    if isinstance(value, list):
+        first = next((x for x in value if x is not None), None)
+        return "[" + (_structure(first, depth + 1) if first is not None else "") + "]"
+    if isinstance(value, bool) or value is None:
+        return "b" if isinstance(value, bool) else "n"
+    return "s" if isinstance(value, str) else "d"
+
+
 def _shape_signature(ex: Exchange) -> str | None:
+    """Response fingerprint used to decide whether varying path segments are one parameterized endpoint.
+
+    Deep enough that collections sharing an envelope (``{"data": [...]}``) but holding different
+    records (users vs. orders) do not look alike.
+    """
     if ex.status is None or not 200 <= ex.status < 300:
         return None
     data = parse_json(ex.resp_body) if is_json_type(ex.resp_content_type) or ex.resp_body else None
-    if isinstance(data, dict):
-        return "obj:" + ",".join(sorted(data)[:40])
-    if isinstance(data, list):
-        first = next((x for x in data if isinstance(x, dict)), None)
-        return "list:" + (",".join(sorted(first)[:40]) if first else "")
+    if isinstance(data, dict | list):
+        if isinstance(data, list) and not data:
+            return None  # an empty list says nothing about the record shape
+        return _structure(data)
     return "ct:" + media_type(ex.resp_content_type)
 
 

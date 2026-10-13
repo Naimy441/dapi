@@ -34,3 +34,22 @@ def run_demo_session(client: httpx.Client, base: str, *, expire_wait: float = 0.
         auth["Authorization"] = f"Bearer {tokens['access_token']}"
         client.get(f"{base}/api/v1/me", headers=auth)
         client.get(f"{base}/api/v1/projects", headers=auth)
+
+
+def run_web_session(client: httpx.Client, base: str) -> None:
+    """Browser-like session against demo_web_app: CSRF cookie -> form login -> cookie-authenticated API."""
+    client.get(f"{base}/api/profile")  # 403 before login
+    page = client.get(f"{base}/login")
+    token = page.text.split("name=csrfmiddlewaretoken value=")[1].split(">")[0]
+    client.post(
+        f"{base}/login", data={"username": "alice", "password": "wonderland", "csrfmiddlewaretoken": token}
+    )
+    client.get(f"{base}/api/profile")
+    notes = client.get(f"{base}/api/notes").json()
+    for n in notes:
+        client.get(f"{base}/api/notes/{n['id']}")
+    client.post(
+        f"{base}/api/notes",
+        json={"title": "New", "body": "x"},
+        headers={"X-CSRFToken": client.cookies["csrftoken"]},
+    )

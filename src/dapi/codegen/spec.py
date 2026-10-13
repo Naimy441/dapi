@@ -100,6 +100,9 @@ class TokenFlow:
     expires_in_path: list[str] | None
     secret_params: list[str]
     evidence: list[int]
+    # requests to make first, to obtain values for {{secret:NAME}} markers (e.g. a CSRF cookie):
+    # {"method", "path", "values": {NAME: {"cookie": name} | {"json": [path...]}}, "evidence": [flow ids]}
+    prerequisites: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass
@@ -109,7 +112,8 @@ class AuthSpec:
     scheme: str | None = None
     query_name: str | None = None
     cookie_names: list[str] = field(default_factory=list)
-    extra_headers: list[str] = field(default_factory=list)  # other credential headers (e.g. CSRF)
+    extra_headers: list[str] = field(default_factory=list)  # other credential headers
+    csrf: list[dict[str, str]] = field(default_factory=list)  # [{"header": h, "cookie": c}] echo pairs
     login: TokenFlow | None = None
     refresh: TokenFlow | None = None
     lifetime_seconds: float | None = None
@@ -127,7 +131,9 @@ class ClientSpec:
     auth: AuthSpec
 
 
-def _template_from_body(body: str | None, content_type: str, kinds: dict[str, str]) -> tuple[Any, list[str]]:
+def _template_from_body(
+    body: str | None, content_type: str, kinds: dict[str, str], marker_refs: dict[str, str] | None = None
+) -> tuple[Any, list[str]]:
     """Replace secret placeholders in a redacted body with semantic markers."""
     secret_params: list[str] = []
 
@@ -138,6 +144,9 @@ def _template_from_body(body: str | None, content_type: str, kinds: dict[str, st
         name = snake(field_path.rsplit(".", 1)[-1].split(":", 1)[-1])
         if name not in secret_params:
             secret_params.append(name)
+        ref = PLACEHOLDER_RE.search(value)
+        if marker_refs is not None and ref:
+            marker_refs[name] = ref.group(1)
         return "{{secret:" + name + "}}"
 
     if is_form_type(content_type):
@@ -166,7 +175,11 @@ def _token_flow(analysis: Analysis, item: dict[str, Any], access_locations: set[
     flow = ctx.flows[item["successful_flows"][-1]]
     kinds = {s.location: ctx.kind(s.ref) for s in ctx.by_flow.get(flow.id, []) if s.side == "request"}
     body_kind = "form" if is_form_type(flow.req_content_type) else "json"
-    template, secret_params = _template_from_body(flow.req_body, flow.req_content_type, kinds)
+    marker_refs: dict[str, str] = {}
+    template, secret_params = _template_from_body(flow.req_body, flow.req_content_type, kinds, marker_refs)
+    prerequisites = _prerequisites(analysis, flow, marker_refs)
+    satisfied = {name for p in prerequisites for name in p["values"]}
+    secret_params = [p for p in secret_params if p not in satisfied]
     issued = {s.location: ctx.kind(s.ref) for s in ctx.by_flow.get(flow.id, []) if s.side == "response"}
     access = next((loc for loc in issued if loc in access_locations), None)
     if access is None:
@@ -195,14 +208,53 @@ def _token_flow(analysis: Analysis, item: dict[str, Any], access_locations: set[
         expires_in_path=expires_path,
         secret_params=secret_params,
         evidence=item["successful_flows"][-3:],
+        prerequisites=prerequisites,
     )
+
+
+def _prerequisites(analysis: Analysis, flow: Any, marker_refs: dict[str, str]) -> list[dict[str, Any]]:
+    """For secret body fields that an earlier response issued (CSRF tokens, nonces), plan the call
+    that obtains a fresh value, and where to read it from (a cookie or a JSON path)."""
+    ctx = analysis.ctx
+    calls: dict[tuple[str, str], dict[str, Any]] = {}
+    for name, ref in marker_refs.items():
+        first = ctx.issue(ref)
+        if first is None or first.flow_id == flow.id:
+            continue
+        issuer = ctx.flows[first.flow_id]
+        if issuer.method not in {"GET", "HEAD"}:
+            continue
+        if first.location.startswith("set-cookie:"):
+            source: dict[str, Any] = {"cookie": first.location.split(":", 1)[1]}
+        elif (path := location_path(first.location)) is not None:
+            source = {"json": path}
+        else:
+            continue
+        call = calls.setdefault(
+            (issuer.method, issuer.path),
+            {"method": issuer.method, "path": issuer.path, "values": {}, "evidence": [issuer.id]},
+        )
+        call["values"][name] = source
+    return list(calls.values())
 
 
 def build_auth_spec(analysis: Analysis, origin: str) -> AuthSpec:
     model = analysis.auth_for(origin)
-    mechanisms = [m for m in model.get("mechanisms", []) if m.get("necessary") is not False]
+    csrf_pairs = [c for c in model.get("csrf", []) if c["source"].startswith("set-cookie:")]
+    csrf_headers = {f"header:{c['header']}".lower() for c in csrf_pairs}
+    csrf_cookies = {"cookie:" + c["source"].split(":", 1)[1] for c in csrf_pairs}
+    # CSRF double-submit values are echoed by the client, not session credentials
+    mechanisms = [
+        m
+        for m in model.get("mechanisms", [])
+        if m.get("necessary") is not False
+        and m["location"].lower() not in csrf_headers
+        and m["location"] not in csrf_cookies
+        and m["type"] != "csrf_header"
+    ]
     spec = AuthSpec()
     if not mechanisms:
+        spec.csrf = [{"header": c["header"], "cookie": c["source"].split(":", 1)[1]} for c in csrf_pairs]
         return spec
     primary = sorted(
         mechanisms,
@@ -236,6 +288,7 @@ def build_auth_spec(analysis: Analysis, origin: str) -> AuthSpec:
         spec.login = spec.login or _token_flow(analysis, item, access_locations)
     for item in model.get("refresh", []):
         spec.refresh = spec.refresh or _token_flow(analysis, item, access_locations)
+    spec.csrf = [{"header": c["header"], "cookie": c["source"].split(":", 1)[1]} for c in csrf_pairs]
     spec.notes = model.get("notes", [])
     return spec
 

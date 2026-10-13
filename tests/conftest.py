@@ -11,7 +11,8 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path[:0] = [str(ROOT / "examples"), str(Path(__file__).parent)]
 
 from demo_api import serve  # noqa: E402
-from scenario import run_demo_session  # noqa: E402
+from demo_web_app import serve as serve_web  # noqa: E402
+from scenario import run_demo_session, run_web_session  # noqa: E402
 
 from dapi import Workspace  # noqa: E402
 from dapi.capture.httpx_recorder import RecordingTransport  # noqa: E402
@@ -43,6 +44,21 @@ def short_ttl_demo():
     server, base = start_demo(ttl=2)
     yield base
     server.shutdown()
+
+
+@pytest.fixture
+def web_demo():
+    server = serve_web(0)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    yield f"http://127.0.0.1:{server.server_address[1]}"
+    server.shutdown()
+
+
+@pytest.fixture
+def web_recorded(ws, web_demo):
+    with httpx.Client(transport=RecordingTransport(ws)) as client:
+        run_web_session(client, web_demo)
+    return ws, web_demo
 
 
 @pytest.fixture

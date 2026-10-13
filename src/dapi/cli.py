@@ -62,7 +62,8 @@ def cmd_capture(args: argparse.Namespace) -> None:
     print(f"dapi: recording into {ws.home} (scope: {ws.config.scope or 'everything'})", file=sys.stderr)
     for h in hints["how_to_route_traffic"]:
         print(f"  - {h}", file=sys.stderr)
-    sys.exit(run_foreground(ws, args.port, args.scope, args.mode, args.listen_host, args.mitm_args))
+    extra = (["--ssl-insecure"] if args.ssl_insecure else []) + list(args.mitm_args or [])
+    sys.exit(run_foreground(ws, args.port, args.scope, args.mode, args.listen_host, extra))
 
 
 def cmd_import(args: argparse.Namespace) -> None:
@@ -282,6 +283,11 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument(
         "--mode",
         help="mitmproxy mode, e.g. wireguard, reverse:https://api.example.com, upstream:http://host:port",
+    )
+    s.add_argument(
+        "--ssl-insecure",
+        action="store_true",
+        help="don't verify upstream TLS certs (self-signed staging hosts)",
     )
     s.add_argument("mitm_args", nargs=argparse.REMAINDER, help="extra mitmdump arguments after --")
     s.set_defaults(fn=cmd_capture)

@@ -245,3 +245,76 @@ def test_manual_session(ws, demo, monkeypatch):
     )
     assert report["session"]["source"] == "manual"
     assert tokens["access_token"] not in json.dumps(report)
+
+
+def _self_signed(tmp_path):
+    import datetime
+    import ipaddress
+
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import ec
+    from cryptography.x509.oid import NameOID
+
+    key = ec.generate_private_key(ec.SECP256R1())
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "localhost")])
+    now = datetime.datetime.now(datetime.UTC)
+    cert = (
+        x509.CertificateBuilder()
+        .subject_name(name)
+        .issuer_name(name)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - datetime.timedelta(days=1))
+        .not_valid_after(now + datetime.timedelta(days=1))
+        .add_extension(
+            x509.SubjectAlternativeName(
+                [x509.DNSName("localhost"), x509.IPAddress(ipaddress.ip_address("127.0.0.1"))]
+            ),
+            critical=False,
+        )
+        .sign(key, hashes.SHA256())
+    )
+    cert_path, key_path = tmp_path / "cert.pem", tmp_path / "key.pem"
+    cert_path.write_bytes(cert.public_bytes(serialization.Encoding.PEM))
+    key_path.write_bytes(
+        key.private_bytes(
+            serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8, serialization.NoEncryption()
+        )
+    )
+    return cert_path, key_path
+
+
+def test_https_capture_through_mitmproxy(ws, tmp_path):
+    import ssl
+    import threading
+    from pathlib import Path
+
+    from demo_api import serve
+
+    cert, key = _self_signed(tmp_path)
+    server = serve(0)
+    ctx = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
+    ctx.load_cert_chain(cert, key)
+    server.socket = ctx.wrap_socket(server.socket, server_side=True)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    base = f"https://127.0.0.1:{server.server_address[1]}"
+
+    svc = DapiService(ws)
+    started = svc.capture_start(port=free_port(), scope=["127.0.0.1"], ssl_insecure=True)
+    ca = Path.home() / ".mitmproxy" / "mitmproxy-ca-cert.pem"
+    try:
+        with httpx.Client(
+            proxy=started["proxy_url"], verify=ssl.create_default_context(cafile=str(ca)), timeout=10
+        ) as c:
+            run_demo_session(c, base)
+    finally:
+        svc.capture_stop()
+        server.shutdown()
+    flows = svc.traffic_list(limit=100)
+    assert flows["total"] == 13 and flows["flows"][0]["url"].startswith("https://127.0.0.1:")
+    auth = svc.auth_analyze()
+    assert auth["origin"] == base
+    assert any(m["type"] == "bearer" for m in auth["mechanisms"])
+    detail = svc.traffic_get(3)
+    assert detail["request"]["body"]["password"].startswith("{{secret:")

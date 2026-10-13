@@ -114,11 +114,12 @@ class DapiService:
         scope: list[str] | None = None,
         mode: str | None = None,
         listen_host: str = "127.0.0.1",
+        ssl_insecure: bool = False,
     ) -> dict[str, Any]:
         if scope:
             self.ws.config.scope = scope
             self.ws.save_config()
-        return runner.start_background(self.ws, port, scope, mode, listen_host)
+        return runner.start_background(self.ws, port, scope, mode, listen_host, ssl_insecure=ssl_insecure)
 
     @safe
     def capture_stop(self) -> dict[str, Any]:

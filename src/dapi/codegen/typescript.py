@@ -56,6 +56,7 @@ def _flow_literal(tf: TokenFlow | None) -> str:
             "refreshTokenPath": tf.refresh_token_path,
             "expiresInPath": tf.expires_in_path,
             "secretParams": tf.secret_params,
+            "prerequisites": tf.prerequisites,
             "evidenceFlows": tf.evidence,
         },
         indent=2,
@@ -94,7 +95,11 @@ def generate_typescript(spec: ClientSpec) -> str:
     w(f"const AUTH_SCHEME: string | null = {json.dumps(a.scheme)};\n")
     w(f"const AUTH_QUERY_PARAM: string | null = {json.dumps(a.query_name)};\n")
     w(f"const LOGIN_FLOW: TokenFlow | null = {_flow_literal(a.login)};\n")
-    w(f"const REFRESH_FLOW: TokenFlow | null = {_flow_literal(a.refresh)};\n\n")
+    w(f"const REFRESH_FLOW: TokenFlow | null = {_flow_literal(a.refresh)};\n")
+    w(f"const SESSION_COOKIES: string[] = {json.dumps(a.cookie_names)};\n")
+    w(
+        f"const CSRF_PAIRS: Array<{{ header: string; cookie: string }}> = {json.dumps(a.csrf)}; // header <- cookie echo\n\n"
+    )
     if a.notes:
         w("// Auth evidence (from dapi auth analysis):\n")
         for n in a.notes[:12]:
@@ -145,6 +150,7 @@ RUNTIME = r"""interface TokenFlow {
   refreshTokenPath: string[] | null;
   expiresInPath: string[] | null;
   secretParams: string[];
+  prerequisites: Array<{ method: string; path: string; values: Record<string, { cookie?: string; json?: string[] }>; evidence: number[] }>;
   evidenceFlows: number[];
 }
 
@@ -283,6 +289,9 @@ export class __CLASS__ {
         headers[AUTH_HEADER ?? "Authorization"] = AUTH_SCHEME ? `${AUTH_SCHEME} ${this.token}` : this.token;
       }
     }
+    for (const pair of CSRF_PAIRS) {
+      if (this.cookies[pair.cookie]) headers[pair.header] = this.cookies[pair.cookie];
+    }
     const cookie = Object.entries(this.cookies).map(([k, v]) => `${k}=${v}`).join("; ");
     if (cookie) headers["Cookie"] = cookie;
     let body: string | undefined;
@@ -301,12 +310,27 @@ export class __CLASS__ {
   }
 
   private async runTokenFlow(flow: TokenFlow, values: Record<string, unknown>): Promise<Record<string, unknown>> {
+    const prefetched: Record<string, unknown> = {};
+    for (const pre of flow.prerequisites ?? []) {
+      const res = await this.send(pre.method, pre.path, { auth: false });
+      const text = await res.text();
+      for (const [name, source] of Object.entries(pre.values)) {
+        if (source.cookie) prefetched[`secret:${name}`] = this.cookies[source.cookie];
+        else if (source.json) {
+          try { prefetched[`secret:${name}`] = getPath(JSON.parse(text), source.json); } catch { /* not JSON */ }
+        }
+      }
+    }
     const secretValues = Object.fromEntries(Object.entries(this.secrets).map(([k, v]) => [`secret:${k}`, v]));
-    const body = fill(flow.template, { ...secretValues, ...values });
+    const body = fill(flow.template, { ...prefetched, ...secretValues, ...values });
     const res = await this.send(flow.method, flow.path, { body, bodyKind: flow.bodyKind, auth: false });
     const text = await res.text();
-    if (!res.ok) throw new ApiError(res.status, text, flow.method, flow.path);
-    const data = text ? JSON.parse(text) : {};
+    if (res.status >= 400) throw new ApiError(res.status, text, flow.method, flow.path);
+    let data: Record<string, unknown> = {};
+    try { data = text ? JSON.parse(text) : {}; } catch { data = {}; }
+    if (AUTH_KIND === "cookie" && SESSION_COOKIES.length && !SESSION_COOKIES.some((c) => this.cookies[c])) {
+      throw new Error(`${flow.path} did not set a session cookie (${SESSION_COOKIES.join(", ")}); check the credentials`);
+    }
     const token = getPath(data, flow.accessTokenPath);
     if (typeof token === "string") {
       this.token = token;

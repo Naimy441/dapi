@@ -85,6 +85,7 @@ def start_background(
     mode: str | None = None,
     listen_host: str = "127.0.0.1",
     wait: float = 15.0,
+    ssl_insecure: bool = False,
 ) -> dict[str, Any]:
     current = status(ws)
     if current.get("running"):
@@ -108,6 +109,8 @@ def start_background(
         cmd += ["--scope", s]
     if mode:
         cmd += ["--mode", mode]
+    if ssl_insecure:
+        cmd.append("--ssl-insecure")
     with open(log_path, "ab") as log:
         proc = subprocess.Popen(
             cmd, stdout=log, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, start_new_session=True

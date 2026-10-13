@@ -81,10 +81,13 @@ def build_server(workspace: Workspace | None = None) -> Any:
         listen_host: Annotated[
             str, Field(description="Use 0.0.0.0 to accept traffic from a phone on the LAN")
         ] = "127.0.0.1",
+        ssl_insecure: Annotated[
+            bool, Field(description="Skip upstream TLS verification (self-signed staging servers)")
+        ] = False,
     ) -> dict[str, Any]:
         """Start a background mitmproxy that records (redacted) traffic into the workspace.
         Returns the proxy URL and instructions for routing a browser, CLI, or mobile app through it."""
-        return await call(svc.capture_start, port, scope, mode, listen_host)
+        return await call(svc.capture_start, port, scope, mode, listen_host, ssl_insecure)
 
     @server.tool(annotations=LOCAL_WRITE)
     async def capture_stop() -> dict[str, Any]:

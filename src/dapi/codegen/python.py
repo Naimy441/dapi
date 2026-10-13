@@ -51,6 +51,7 @@ def _token_flow_literal(tf: TokenFlow | None) -> str:
         "refresh_token_path": tf.refresh_token_path,
         "expires_in_path": tf.expires_in_path,
         "secret_params": tf.secret_params,
+        "prerequisites": tf.prerequisites,
         "evidence_flows": tf.evidence,
     }
     return repr(json.loads(json.dumps(data)))
@@ -92,6 +93,7 @@ def generate_python(spec: ClientSpec) -> str:
     w(f"SESSION_COOKIES = {a.cookie_names!r}\n")
     w(f"LOGIN_FLOW: dict[str, Any] | None = {_token_flow_literal(a.login)}\n")
     w(f"REFRESH_FLOW: dict[str, Any] | None = {_token_flow_literal(a.refresh)}\n")
+    w(f"CSRF_PAIRS: list[dict[str, str]] = {a.csrf!r}  # header <- cookie echo, observed\n")
     w(f"TOKEN_LIFETIME_SECONDS: float | None = {a.lifetime_seconds!r}\n\n")
     if a.notes:
         w("# Auth evidence (from dapi auth analysis):\n")
@@ -281,13 +283,46 @@ class __CLASS__:
         self.close()
 
     # -- auth -----------------------------------------------------------------------------------
+    def _run_prerequisites(self, flow: dict[str, Any]) -> dict[str, Any]:
+        """Fetch values (e.g. CSRF tokens) that the observed flow obtained from earlier responses."""
+        values: dict[str, Any] = {}
+        for pre in flow.get("prerequisites") or []:
+            resp = self._http.request(pre["method"], pre["path"])
+            data: Any = None
+            for name, source in pre["values"].items():
+                if "cookie" in source:
+                    values[f"secret:{name}"] = self._http.cookies.get(source["cookie"])
+                else:
+                    if data is None:
+                        try:
+                            data = resp.json()
+                        except ValueError:
+                            data = {}
+                    values[f"secret:{name}"] = _get_path(data, source["json"])
+        return values
+
+    def _csrf_headers(self) -> dict[str, str]:
+        headers = {}
+        for pair in CSRF_PAIRS:
+            value = self._http.cookies.get(pair["cookie"])
+            if value:
+                headers[pair["header"]] = value
+        return headers
+
     def _run_token_flow(self, flow: dict[str, Any], values: dict[str, Any]) -> dict[str, Any]:
-        body = _fill(flow["template"], {**{f"secret:{k}": v for k, v in self.secrets.items()}, **values})
+        prefetched = self._run_prerequisites(flow)
+        secrets = {f"secret:{k}": v for k, v in self.secrets.items()}
+        body = _fill(flow["template"], {**prefetched, **secrets, **values})
         kwargs = {"json": body} if flow["body_kind"] == "json" else {"data": body}
-        resp = self._http.request(flow["method"], flow["path"], **kwargs)
+        resp = self._http.request(flow["method"], flow["path"], headers=self._csrf_headers(), **kwargs)
         if resp.status_code >= 400:
             raise ApiError(resp)
-        data = resp.json() if resp.content else {}
+        try:
+            data = resp.json() if resp.content else {}
+        except ValueError:
+            data = {}
+        if AUTH_KIND == "cookie" and SESSION_COOKIES and not any(self._http.cookies.get(c) for c in SESSION_COOKIES):
+            raise RuntimeError(f"{flow['path']} did not set a session cookie {SESSION_COOKIES}; check the credentials")
         token = _get_path(data, flow.get("access_token_path"))
         if token:
             self.token = token
@@ -320,7 +355,7 @@ class __CLASS__:
             if LOGIN_FLOW is not None and self.username and self.password:
                 self.login()
                 return True
-        except (ApiError, ValueError, httpx.HTTPError):
+        except (ApiError, ValueError, RuntimeError, httpx.HTTPError):
             return False
         return False
 
@@ -343,8 +378,8 @@ class __CLASS__:
             self._reauthenticate()
 
         def send() -> httpx.Response:
-            return self._http.request(method, path, params=query or None, json=json, data=data,
-                                      headers=self._auth_headers() if auth else None)
+            headers = {**self._csrf_headers(), **(self._auth_headers() if auth else {})}
+            return self._http.request(method, path, params=query or None, json=json, data=data, headers=headers)
 
         resp = send()
         if resp.status_code in (401, 403) and auth and self.auto_refresh and self._reauthenticate():

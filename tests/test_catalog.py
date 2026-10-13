@@ -93,3 +93,16 @@ def test_schema_merge_and_check():
     assert check(s, {"a": 3, "c": None}) == []
     assert check(s, {"a": "nope", "c": None})
     assert check(s, {"c": None})  # missing always-present key
+
+
+def test_shared_envelope_collections_stay_separate():
+    flows = [
+        ex(1, "GET", "/v1/users", body={"data": [{"id": 1, "email": "a@b.co"}], "meta": {"page": 1}}),
+        ex(
+            2, "GET", "/v1/orders", body={"data": [{"id": 9, "total": 3.5, "lines": []}], "meta": {"page": 1}}
+        ),
+        ex(3, "GET", "/v1/products", body={"data": [{"sku": "x", "price": 1}], "meta": {"page": 1}}),
+        ex(4, "GET", "/v1/users", body={"data": [{"id": 2, "email": "c@d.co"}], "meta": {"page": 2}}),
+    ]
+    paths = {e.path_template for e in build_catalog(flows).endpoints}
+    assert paths == {"/v1/users", "/v1/orders", "/v1/products"}
