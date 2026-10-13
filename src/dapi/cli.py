@@ -13,6 +13,7 @@ import sys
 from typing import Any
 
 from dapi import __version__
+from dapi.service import DapiError
 
 
 def _print(data: Any) -> None:
@@ -395,7 +396,7 @@ def main(argv: list[str] | None = None) -> None:
         args.mitm_args = args.mitm_args[1:]
     try:
         args.fn(args)
-    except (KeyError, LookupError, ValueError, RuntimeError) as exc:
+    except (KeyError, LookupError, ValueError, RuntimeError, DapiError) as exc:
         sys.exit(f"dapi: {exc.args[0] if exc.args else exc}")
 
 

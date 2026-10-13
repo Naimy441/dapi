@@ -34,13 +34,21 @@ def _truncate(obj: Any, limit: int = MAX_STRING) -> Any:
     return obj
 
 
+class DapiError(Exception):
+    """A tool failure whose message has been scrubbed of secrets."""
+
+
 def safe(fn):
-    """Scrub and truncate every result before it leaves dapi."""
+    """Scrub and truncate every result *and every error message* before it leaves dapi."""
 
     @functools.wraps(fn)
     def wrapper(self: DapiService, *args: Any, **kwargs: Any) -> Any:
         self._sync()
-        result = fn(self, *args, **kwargs)
+        try:
+            result = fn(self, *args, **kwargs)
+        except Exception as exc:
+            message = exc.args[0] if len(exc.args) == 1 and isinstance(exc.args[0], str) else str(exc)
+            raise DapiError(self.ws.redactor.scrub_string(message)) from None
         return _truncate(self.ws.vault.scrub_obj(json.loads(json.dumps(result, default=str))))
 
     return wrapper

@@ -168,3 +168,23 @@ def test_scope_and_static_filtering(ws):
         )
         is None
     )
+
+
+def test_tool_errors_are_scrubbed(ws):
+    import pytest
+
+    from dapi.service import DapiError, DapiService
+
+    ws.vault.put("leaky-secret-value-9", "token")
+    svc = DapiService(ws)
+
+    def boom(*a, **k):
+        raise ValueError(
+            "upstream said: leaky-secret-value-9 and eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0In0.c2ln"
+        )
+
+    svc.ws.store.get_flow = boom
+    with pytest.raises(DapiError) as err:
+        svc.traffic_get(1)
+    assert "leaky-secret-value-9" not in str(err.value) and "eyJ" not in str(err.value)
+    assert "{{secret:" in str(err.value)

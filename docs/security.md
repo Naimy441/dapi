@@ -36,7 +36,8 @@ about the value.
 ## Output guards
 
 - Every MCP tool and CLI JSON result goes through `Vault.scrub_obj` before it is returned. This is a second,
-  independent pass on top of ingest redaction.
+  independent pass on top of ingest redaction. Error messages are scrubbed the same way: they surface as
+  `DapiError`, so an upstream error quoting a token-bearing URL can't leak it.
 - mitmproxy runs with `flow_detail=0`, so its console never prints raw flows. dapi logs only redacted summaries.
 - Generated clients never embed credentials. They take them as arguments, from environment variables
   (`<PREFIX>_TOKEN`, …) or from `from_dapi()`, which decrypts the vault inside the user's own process.
